@@ -246,6 +246,10 @@ function selectedPELinesHaveEstimatedDate(linesList) {
   return selectedLines.length > 0 && selectedLines.every((line) => Boolean(parseDateValue(line.estimatedDate)))
 }
 
+function selectedDateAssignmentRequiresReason(linesList) {
+  return selectedOpenPELines(linesList).some((line) => Boolean(parseDateValue(line.estimatedDate)))
+}
+
 function receiptCaptureValue(line) {
   return Math.min(numericValue(line.requested), numericValue(line.receivedDraft ?? line.received))
 }
@@ -448,11 +452,11 @@ function uniqueProformaId(preferredId, proformasList) {
   return nextId
 }
 
-function initialCaseDocuments({ ot, proforma }) {
+function initialCaseDocuments({ ot, proforma, clientAssumes = false }) {
   return {
     ot: pendingDocument('OT', ot || 'Sin referencia', 'Orden de taller pendiente'),
     proforma: pendingDocument('Presupuesto / Proforma', proforma || 'Sin referencia', 'Presupuesto pendiente'),
-    ocSeguro: pendingDocument('OC del seguro', 'Sin referencia', 'OC del seguro pendiente'),
+    ...(clientAssumes ? {} : { ocSeguro: pendingDocument('OC del seguro', 'Sin referencia', 'OC del seguro pendiente') }),
     additional: [],
     supplementalSets: [],
     futureGroups: [],
@@ -1043,7 +1047,8 @@ function supplementalSetForProforma(caseItem, proformaId) {
 function hiddenDamageDocumentsReady(caseItem, proforma) {
   if (!proforma || proforma.type !== 'Daño oculto') return true
   const set = supplementalSetForProforma(caseItem, proforma.id)
-  return Boolean(set && isDocumentReady(set.documents?.proforma) && isDocumentReady(set.documents?.ocSeguro))
+  if (!set) return false
+  return Boolean(isDocumentReady(set.documents?.proforma) && (set.clientAssumes || isDocumentReady(set.documents?.ocSeguro)))
 }
 
 function hiddenDamageCanAdvanceInventory(caseItem, proforma) {
@@ -1055,7 +1060,7 @@ function hiddenDamageCanAdvanceInventory(caseItem, proforma) {
 function hiddenDamageSetReadyForBodega(caseItem, set) {
   if (!set || set.type !== 'Daño oculto') return false
   const documents = set.documents || {}
-  return isDocumentReady(documents.proforma) && isDocumentReady(documents.ocSeguro)
+  return isDocumentReady(documents.proforma) && (set.clientAssumes || isDocumentReady(documents.ocSeguro))
 }
 
 function hasActiveHiddenDamage(caseItem, proformasList = []) {
@@ -1449,11 +1454,14 @@ function App() {
       const nextId = `CP-${String(casesData.length + 123).padStart(6, '0')}`
       const requestedProformaId = values.proforma.trim()
       const nextProformaId = requestedProformaId ? uniqueProformaId(requestedProformaId, proformasData) : ''
+      const clientAssumes = Boolean(values.clientAssumes)
       const nextCase = {
         id: nextId,
         client: values.client || 'Cliente nuevo',
         vehicle: values.vehicle || 'Vehiculo pendiente',
         plate: values.plate || 'Sin placa',
+        insurer: clientAssumes ? '' : values.insurer,
+        clientAssumes,
         owner: activeUser.name,
         registeredBy: activeUser.name,
         state: 'Expediente pendiente de completar',
@@ -1467,6 +1475,7 @@ function App() {
         documents: initialCaseDocuments({
           ot: values.ot,
           proforma: nextProformaId,
+          clientAssumes,
         }),
       }
       setCasesData((current) => [nextCase, ...current])
@@ -1628,6 +1637,7 @@ function App() {
         showToast('Seleccione al menos una linea pendiente para asignar fecha')
         return
       }
+      const requiresReason = selectedDateAssignmentRequiresReason(peLinesData)
       const nextDate = values.newDate || '20/09/2026'
       const nextLines = normalizePELines(peLinesData).map((line) => {
         if (!line.selected || line.pending === 0) return line
@@ -1656,8 +1666,10 @@ function App() {
         state: 'PE en camino',
         nextAction,
       } : current)
-      addPEBitacora(currentPE.id, 'Cambio de fecha PE', currentPE.eta, nextEta, values.reason || 'Proveedor', values.comment || `Fecha ${nextDate} asignada a ${linesToUpdate.length} linea(s)`)
-      addCaseBitacora(currentPE.caseId, 'Cambio de fecha PE', currentPE.eta, nextEta, values.reason || 'Proveedor', `PE ${currentPE.id}: fecha ${nextDate} asignada a ${linesToUpdate.length} linea(s)`)
+      const eventName = requiresReason ? 'Cambio de fecha PE' : 'Asignación de fecha PE'
+      const eventReason = requiresReason ? (values.reason || 'Cambio de fecha') : 'Fecha nueva'
+      addPEBitacora(currentPE.id, eventName, currentPE.eta, nextEta, eventReason, values.comment || `Fecha ${nextDate} asignada a ${linesToUpdate.length} linea(s)`)
+      addCaseBitacora(currentPE.caseId, eventName, currentPE.eta, nextEta, eventReason, `PE ${currentPE.id}: fecha ${nextDate} asignada a ${linesToUpdate.length} linea(s)`)
       showToast('Notificación enviada a los involucrados del caso', 5000)
       return
     }
@@ -1875,6 +1887,7 @@ function App() {
       const proformaId = uniqueProformaId(proformaReference, proformasData)
       const ocReference = values.hiddenDamageOC.trim()
       const otReference = values.hiddenDamageOT.trim()
+      const clientAssumes = Boolean(values.clientAssumes)
       const existingSets = normalizeDocuments(currentCase.documents).supplementalSets
       let nextSetNumber = existingSets.length + 1
       let nextSetId = `DO-${String(nextSetNumber).padStart(3, '0')}`
@@ -1882,26 +1895,30 @@ function App() {
         nextSetNumber += 1
         nextSetId = `DO-${String(nextSetNumber).padStart(3, '0')}`
       }
+      const nextSetDocuments = {
+        proforma: values.hiddenDamageProformaFileName
+          ? uploadedDocument('Proforma daño oculto', proformaReference, proformaId, reason, values.hiddenDamageProformaFileName)
+          : pendingDocument('Proforma daño oculto', proformaId, reason),
+      }
+      if (!clientAssumes) {
+        nextSetDocuments.ocSeguro = values.hiddenDamageOCFileName
+          ? uploadedDocument('OC del seguro daño oculto', ocReference, ocReference || 'Pendiente', 'OC del seguro asociada al daño oculto', values.hiddenDamageOCFileName)
+          : pendingDocument('OC del seguro daño oculto', ocReference || 'Pendiente', 'OC del seguro asociada al daño oculto')
+      }
+      nextSetDocuments.ot = otReference
+        ? registeredDocument('OT daño oculto', otReference, 'OT opcional asociada al daño oculto', values.hiddenDamageOTFileName)
+        : values.hiddenDamageOTFileName
+          ? uploadedDocument('OT daño oculto', '', 'Opcional', 'OT opcional asociada al daño oculto', values.hiddenDamageOTFileName)
+          : pendingDocument('OT daño oculto', 'Opcional', 'OT opcional asociada al daño oculto')
       const nextSet = {
         id: nextSetId,
         proformaId,
         type: 'Daño oculto',
         reason,
+        clientAssumes,
         sentToBodega: false,
         createdAt: 'Ahora',
-        documents: {
-          proforma: values.hiddenDamageProformaFileName
-            ? uploadedDocument('Proforma daño oculto', proformaReference, proformaId, reason, values.hiddenDamageProformaFileName)
-            : pendingDocument('Proforma daño oculto', proformaId, reason),
-          ocSeguro: values.hiddenDamageOCFileName
-            ? uploadedDocument('OC del seguro daño oculto', ocReference, ocReference || 'Pendiente', 'OC del seguro asociada al daño oculto', values.hiddenDamageOCFileName)
-            : pendingDocument('OC del seguro daño oculto', ocReference || 'Pendiente', 'OC del seguro asociada al daño oculto'),
-          ot: otReference
-            ? registeredDocument('OT daño oculto', otReference, 'OT opcional asociada al daño oculto', values.hiddenDamageOTFileName)
-            : values.hiddenDamageOTFileName
-              ? uploadedDocument('OT daño oculto', '', 'Opcional', 'OT opcional asociada al daño oculto', values.hiddenDamageOTFileName)
-            : pendingDocument('OT daño oculto', 'Opcional', 'OT opcional asociada al daño oculto'),
-        },
+        documents: nextSetDocuments,
       }
       setProformasData((current) => [initialProformaRecord(proformaId, currentCase.id, 'Daño oculto'), ...current])
       setSelectedProformaId(proformaId)
@@ -2059,7 +2076,7 @@ function App() {
       return
     }
     if (!hiddenDamageSetReadyForBodega(currentCase, targetSet)) {
-      showToast('Cargue Proforma y OC del seguro para enviar el daño oculto a Bodega')
+      showToast(targetSet.clientAssumes ? 'Cargue Proforma para enviar el daño oculto a Bodega' : 'Cargue Proforma y OC del seguro para enviar el daño oculto a Bodega')
       return
     }
     const proformaId = targetSet.proformaId || targetSet.documents?.proforma?.reference
@@ -2729,12 +2746,14 @@ function ExpedienteTab({ role, activeUser, currentCase, proformasData, onAddAddi
   const canDeleteDocuments = role === 'Administrador' || (canManageDocuments && currentCase.state === 'Expediente pendiente de completar')
   const canAddDamage = canAddHiddenDamageDocuments(role, currentCase, activeUser)
   const canAddFiniquito = canAddFiniquitoDocument(role, currentCase, proformasData)
-  const baseDocuments = Object.entries(baseDocumentMeta).map(([key, meta]) => ({
-    ...meta,
-    id: key,
-    target: { scope: 'base', key, title: meta.title },
-    document: documents[key],
-  }))
+  const baseDocuments = Object.entries(baseDocumentMeta)
+    .filter(([key]) => !(currentCase.clientAssumes && key === 'ocSeguro'))
+    .map(([key, meta]) => ({
+      ...meta,
+      id: key,
+      target: { scope: 'base', key, title: meta.title },
+      document: documents[key],
+    }))
   const additionalDocuments = [...documents.additional].reverse().map((document) => ({
     id: document.id,
     title: document.title,
@@ -2747,12 +2766,14 @@ function ExpedienteTab({ role, activeUser, currentCase, proformasData, onAddAddi
     description: set.reason,
     set,
     sentToBodega: Boolean(set.sentToBodega),
-    documents: Object.entries(set.documents || {}).map(([key, document]) => ({
-      id: `${set.id}-${key}`,
-      title: document.title,
-      target: { scope: 'set', setId: set.id, key, title: document.title },
-      document,
-    })),
+    documents: Object.entries(set.documents || {})
+      .filter(([key]) => !(set.clientAssumes && key === 'ocSeguro'))
+      .map(([key, document]) => ({
+        id: `${set.id}-${key}`,
+        title: document.title,
+        target: { scope: 'set', setId: set.id, key, title: document.title },
+        document,
+      })),
   }))
   const documentGroups = [
     ...supplementalGroups,
@@ -2765,7 +2786,7 @@ function ExpedienteTab({ role, activeUser, currentCase, proformasData, onAddAddi
     {
       id: 'base',
       title: 'Expediente base',
-      description: 'OT, Presupuesto/Proforma y OC del seguro',
+      description: currentCase.clientAssumes ? 'OT y Presupuesto/Proforma' : 'OT, Presupuesto/Proforma y OC del seguro',
       documents: baseDocuments,
     },
   ]
@@ -3607,6 +3628,7 @@ function Modal({ name, role, currentCase, currentProforma, currentPE, peLinesDat
     hiddenDamageOCFileName: '',
     hiddenDamageOTFileName: '',
     otExecutionNumber: '',
+    clientAssumes: name === 'Agregar daño oculto' ? Boolean(currentCase?.clientAssumes) : false,
   })
   const isCreateCase = name === 'Crear caso'
   const isAddDocument = name === 'Agregar documento al expediente'
@@ -3738,7 +3760,7 @@ function getModalBody(name, role, formValues, setFormValues, currentPE, currentC
     return <JDEFields role={role} values={formValues} setValues={setFormValues} currentPE={currentPE} />
   }
   if (name === 'Cambiar fecha') {
-    return <DateFields values={formValues} setValues={setFormValues} currentPE={currentPE} reasons={dateChangeReasons} />
+    return <DateFields values={formValues} setValues={setFormValues} currentPE={currentPE} peLinesData={peLinesData} reasons={dateChangeReasons} />
   }
   if (name === 'Confirmar disponibilidad fisica y cantidades') {
     return <ReceptionFields values={formValues} setValues={setFormValues} currentPE={currentPE} currentCase={currentCase} peLinesData={peLinesData} />
@@ -3801,14 +3823,20 @@ function CreateCaseFields({ values, setValues }) {
           <span>Placa</span>
           <input value={values.plate} onChange={(event) => updateValue(setValues, 'plate', event.target.value)} placeholder="M 000-000" />
         </label>
-        <label>
-          <span>Aseguradora</span>
-          <select value={values.insurer} onChange={(event) => updateValue(setValues, 'insurer', event.target.value)}>
-            <option value="INISER">INISER</option>
-            <option value="ASSA">ASSA</option>
-            <option value="SEGUROS AMERICA">SEGUROS AMERICA</option>
-          </select>
+        <label className="modal-check span-2">
+          <input type="checkbox" checked={Boolean(values.clientAssumes)} onChange={(event) => updateValue(setValues, 'clientAssumes', event.target.checked)} />
+          <span>Cliente Asume</span>
         </label>
+        {!values.clientAssumes && (
+          <label>
+            <span>Aseguradora</span>
+            <select value={values.insurer} onChange={(event) => updateValue(setValues, 'insurer', event.target.value)}>
+              <option value="INISER">INISER</option>
+              <option value="ASSA">ASSA</option>
+              <option value="SEGUROS AMERICA">SEGUROS AMERICA</option>
+            </select>
+          </label>
+        )}
         <label>
           <span>Numero de OT</span>
           <input
@@ -3909,6 +3937,10 @@ function HiddenDamageFields({ values, setValues }) {
           <span>Motivo / descripción</span>
           <input value={values.hiddenDamageReason} onChange={(event) => updateValue(setValues, 'hiddenDamageReason', event.target.value)} placeholder="Daño oculto identificado durante reparación" />
         </label>
+        <label className="modal-check span-2">
+          <input type="checkbox" checked={Boolean(values.clientAssumes)} onChange={(event) => updateValue(setValues, 'clientAssumes', event.target.checked)} />
+          <span>Cliente Asume</span>
+        </label>
         <label>
           <span>Proforma daño oculto</span>
           <input value={values.hiddenDamageProforma} onChange={(event) => updateValue(setValues, 'hiddenDamageProforma', event.target.value)} placeholder="PF-DO-001" />
@@ -3917,14 +3949,18 @@ function HiddenDamageFields({ values, setValues }) {
           <span>Archivo proforma</span>
           <input type="file" onChange={(event) => updateValue(setValues, 'hiddenDamageProformaFileName', event.target.files?.[0]?.name || '')} />
         </label>
-        <label>
-          <span>OC del seguro</span>
-          <input value={values.hiddenDamageOC} onChange={(event) => updateValue(setValues, 'hiddenDamageOC', event.target.value)} placeholder="OCS-DO-001" />
-        </label>
-        <label>
-          <span>Archivo OC seguro</span>
-          <input type="file" onChange={(event) => updateValue(setValues, 'hiddenDamageOCFileName', event.target.files?.[0]?.name || '')} />
-        </label>
+        {!values.clientAssumes && (
+          <>
+            <label>
+              <span>OC del seguro</span>
+              <input value={values.hiddenDamageOC} onChange={(event) => updateValue(setValues, 'hiddenDamageOC', event.target.value)} placeholder="OCS-DO-001" />
+            </label>
+            <label>
+              <span>Archivo OC seguro</span>
+              <input type="file" onChange={(event) => updateValue(setValues, 'hiddenDamageOCFileName', event.target.files?.[0]?.name || '')} />
+            </label>
+          </>
+        )}
         <label>
           <span>OT opcional</span>
           <input value={values.hiddenDamageOT} onChange={(event) => updateValue(setValues, 'hiddenDamageOT', event.target.value)} placeholder="OT-DO-001" />
@@ -3935,8 +3971,8 @@ function HiddenDamageFields({ values, setValues }) {
         </label>
       </div>
       {!values.hiddenDamageReason.trim() && <div className="notice"><AlertTriangle size={16} /> El motivo del daño oculto es obligatorio. Los documentos pueden quedar pendientes.</div>}
-      {values.hiddenDamageReason.trim() && (!values.hiddenDamageProformaFileName.trim() || !values.hiddenDamageOCFileName.trim()) && (
-        <div className="notice"><AlertTriangle size={16} /> Podra crear el daño oculto, pero no avanzara a detalle, disponibilidad o PE hasta cargar Proforma y OC del seguro.</div>
+      {values.hiddenDamageReason.trim() && (!values.hiddenDamageProformaFileName.trim() || (!values.clientAssumes && !values.hiddenDamageOCFileName.trim())) && (
+        <div className="notice"><AlertTriangle size={16} /> Podra crear el daño oculto, pero no avanzara a detalle, disponibilidad o PE hasta cargar {values.clientAssumes ? 'Proforma' : 'Proforma y OC del seguro'}.</div>
       )}
     </>
   )
@@ -3991,7 +4027,8 @@ function JDEFields({ role, values, setValues, currentPE }) {
   )
 }
 
-function DateFields({ values, setValues, currentPE, reasons }) {
+function DateFields({ values, setValues, currentPE, peLinesData, reasons }) {
+  const requiresReason = selectedDateAssignmentRequiresReason(peLinesData)
   return (
     <>
       <div className="modal-fields">
@@ -4003,14 +4040,16 @@ function DateFields({ values, setValues, currentPE, reasons }) {
           <span>Nueva fecha</span>
           <input type="date" value={values.newDate} onChange={(event) => updateValue(setValues, 'newDate', event.target.value)} />
         </label>
-        <label>
-          <span>Motivo</span>
-          <select value={values.reason} onChange={(event) => updateValue(setValues, 'reason', event.target.value)}>
-            {reasons.map((reason) => (
-              <option key={reason}>{reason}</option>
-            ))}
-          </select>
-        </label>
+        {requiresReason && (
+          <label>
+            <span>Motivo</span>
+            <select value={values.reason} onChange={(event) => updateValue(setValues, 'reason', event.target.value)}>
+              {reasons.map((reason) => (
+                <option key={reason}>{reason}</option>
+              ))}
+            </select>
+          </label>
+        )}
         <label>
           <span>Comentario</span>
           <input value={values.comment} onChange={(event) => updateValue(setValues, 'comment', event.target.value)} placeholder="Comentario de Compras" />

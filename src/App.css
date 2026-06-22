@@ -1309,6 +1309,22 @@ tr.row-warning td {
   grid-column: 1 / -1;
 }
 
+.modal-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+}
+
+.modal-check input {
+  width: 16px;
+  height: 16px;
+}
+
+.modal-check span {
+  color: var(--ink);
+}
+
 .notice {
   display: flex;
   align-items: flex-start;
