@@ -360,10 +360,209 @@ function shouldShowPEProcessFields(role, currentCase, proforma) {
   return Boolean(proforma.peSelectionEnabled || proforma.peGenerated || proforma.peId || proforma.peCount > 0)
 }
 
-function proformaTemplateHref() {
-  const headers = ['ITEM', 'SKU', 'DESCRIPCION', 'REQ', 'DISP', 'AUTORIZACION SEGURO']
-  const sample = ['001', 'FAR-001', 'Faro delantero', '2', '1', 'No autorizado']
-  return `data:text/csv;charset=utf-8,${encodeURIComponent(`${headers.join(',')}\n${sample.join(',')}\n`)}`
+const proformaTemplateSheetName = 'Detalle Proforma'
+const proformaAuthorizationOptions = ['Autorizado', 'No autorizado']
+const proformaTemplateColumns = [
+  { header: 'SKU', key: 'sku', width: 18 },
+  { header: 'DESCRIPCION', key: 'description', width: 34 },
+  { header: 'REQ', key: 'required', width: 12 },
+  { header: 'DISP', key: 'available', width: 12 },
+  { header: 'AUTORIZACION SEGURO', key: 'authorization', width: 24 },
+  { header: 'OBSERVACION', key: 'note', width: 34 },
+]
+const requiredProformaImportHeaders = ['SKU', 'DESCRIPCION', 'REQ', 'DISP', 'AUTORIZACION SEGURO']
+
+async function loadExcelJS() {
+  const module = await import('exceljs')
+  return module.default || module
+}
+
+function normalizeImportHeader(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, ' ')
+}
+
+function cellRawValue(cell) {
+  const value = cell?.value
+  if (value == null) return ''
+  if (typeof value === 'object') {
+    if (Array.isArray(value.richText)) return value.richText.map((part) => part.text || '').join('')
+    if (Object.hasOwn(value, 'result')) return value.result ?? ''
+    if (Object.hasOwn(value, 'text')) return value.text ?? ''
+  }
+  return value
+}
+
+function cellText(cell) {
+  return String(cellRawValue(cell) ?? '').trim()
+}
+
+function parseIntegerCell(cell, field, rowNumber) {
+  const raw = cellRawValue(cell)
+  const text = String(raw ?? '').trim()
+  if (text === '') throw new Error(`Fila ${rowNumber}: ${field} es obligatorio.`)
+  const value = Number(text)
+  if (!Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new Error(`Fila ${rowNumber}: ${field} debe ser un numero entero.`)
+  }
+  return value
+}
+
+function parseAuthorizationCell(cell, rowNumber) {
+  const normalized = normalizeImportHeader(cellText(cell))
+  if (normalized === 'AUTORIZADO') return 'Autorizado'
+  if (normalized === 'NO AUTORIZADO') return 'No autorizado'
+  throw new Error(`Fila ${rowNumber}: AUTORIZACION SEGURO debe ser Autorizado o No autorizado.`)
+}
+
+function requiredTextCell(row, columnNumber, field, rowNumber) {
+  const text = cellText(row.getCell(columnNumber))
+  if (!text) throw new Error(`Fila ${rowNumber}: ${field} es obligatorio.`)
+  return text
+}
+
+function rowHasImportData(row, headerMap) {
+  return [...requiredProformaImportHeaders, 'OBSERVACION'].some((header) => {
+    const columnNumber = headerMap.get(normalizeImportHeader(header))
+    return columnNumber ? Boolean(cellText(row.getCell(columnNumber))) : false
+  })
+}
+
+async function downloadProformaTemplateWorkbook() {
+  const ExcelJS = await loadExcelJS()
+  const workbook = new ExcelJS.Workbook()
+  workbook.creator = 'APEX'
+  workbook.created = new Date()
+  const catalogWorksheet = workbook.addWorksheet('Catalogos')
+  proformaAuthorizationOptions.forEach((option, index) => {
+    catalogWorksheet.getCell(`A${index + 1}`).value = option
+  })
+  catalogWorksheet.state = 'veryHidden'
+
+  const worksheet = workbook.addWorksheet(proformaTemplateSheetName, {
+    views: [{ state: 'frozen', ySplit: 1 }],
+  })
+
+  worksheet.columns = proformaTemplateColumns
+
+  const headerRow = worksheet.getRow(1)
+  headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } }
+  headerRow.alignment = { vertical: 'middle', horizontal: 'center' }
+  headerRow.height = 22
+  headerRow.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF003B95' } }
+    cell.border = { bottom: { style: 'thin', color: { argb: 'FFDCE3EE' } } }
+  })
+
+  worksheet.getColumn('C').numFmt = '0'
+  worksheet.getColumn('D').numFmt = '0'
+
+  for (let rowNumber = 2; rowNumber <= 501; rowNumber += 1) {
+    worksheet.getCell(`C${rowNumber}`).dataValidation = {
+      type: 'whole',
+      operator: 'greaterThan',
+      formulae: [0],
+      allowBlank: false,
+      showErrorMessage: true,
+      errorTitle: 'REQ invalido',
+      error: 'REQ debe ser un numero entero mayor a cero.',
+    }
+    worksheet.getCell(`D${rowNumber}`).dataValidation = {
+      type: 'whole',
+      operator: 'greaterThanOrEqual',
+      formulae: [0],
+      allowBlank: false,
+      showErrorMessage: true,
+      errorTitle: 'DISP invalido',
+      error: 'DISP debe ser un numero entero mayor o igual a cero.',
+    }
+    worksheet.getCell(`E${rowNumber}`).dataValidation = {
+      type: 'list',
+      allowBlank: false,
+      formulae: ['Catalogos!$A$1:$A$2'],
+      showErrorMessage: true,
+      errorTitle: 'Autorizacion invalida',
+      error: 'Seleccione Autorizado o No autorizado.',
+    }
+  }
+
+  const buffer = await workbook.xlsx.writeBuffer()
+  const blob = new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'plantilla-detalle-proforma.xlsx'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
+async function parseProformaDetailWorkbook(file) {
+  if (!file) throw new Error('Seleccione un archivo Excel para cargar el detalle.')
+  if (!String(file.name || '').toLowerCase().endsWith('.xlsx')) {
+    throw new Error('El archivo debe estar en formato .xlsx. Descargue la plantilla y vuelva a intentarlo.')
+  }
+
+  const ExcelJS = await loadExcelJS()
+  const workbook = new ExcelJS.Workbook()
+  await workbook.xlsx.load(await file.arrayBuffer())
+  const worksheet = workbook.getWorksheet(proformaTemplateSheetName) || workbook.worksheets[0]
+  if (!worksheet) throw new Error('El archivo no tiene hojas disponibles para leer.')
+
+  const headerMap = new Map()
+  worksheet.getRow(1).eachCell({ includeEmpty: true }, (cell, columnNumber) => {
+    const header = normalizeImportHeader(cellText(cell))
+    if (header) headerMap.set(header, columnNumber)
+  })
+
+  const missingHeaders = requiredProformaImportHeaders.filter((header) => !headerMap.has(normalizeImportHeader(header)))
+  if (missingHeaders.length > 0) {
+    throw new Error(`La plantilla no tiene las columnas requeridas: ${missingHeaders.join(', ')}.`)
+  }
+
+  const rows = []
+  for (let rowNumber = 2; rowNumber <= worksheet.rowCount; rowNumber += 1) {
+    const row = worksheet.getRow(rowNumber)
+    if (!rowHasImportData(row, headerMap)) continue
+
+    const sku = requiredTextCell(row, headerMap.get('SKU'), 'SKU', rowNumber)
+    const description = requiredTextCell(row, headerMap.get('DESCRIPCION'), 'DESCRIPCION', rowNumber)
+    const required = parseIntegerCell(row.getCell(headerMap.get('REQ')), 'REQ', rowNumber)
+    const available = parseIntegerCell(row.getCell(headerMap.get('DISP')), 'DISP', rowNumber)
+    const authorization = parseAuthorizationCell(row.getCell(headerMap.get('AUTORIZACION SEGURO')), rowNumber)
+    const noteColumn = headerMap.get('OBSERVACION')
+    const note = noteColumn ? cellText(row.getCell(noteColumn)) : ''
+
+    if (required <= 0) throw new Error(`Fila ${rowNumber}: REQ debe ser mayor a cero.`)
+    if (available < 0) throw new Error(`Fila ${rowNumber}: DISP debe ser mayor o igual a cero.`)
+
+    rows.push({
+      item: String(rows.length + 1).padStart(3, '0'),
+      sku,
+      description,
+      required,
+      available,
+      missing: Math.max(required - available, 0),
+      state: lineState(required, available),
+      authorization,
+      decision: '',
+      eligible: '',
+      pe: '',
+      note,
+    })
+  }
+
+  if (rows.length === 0) {
+    throw new Error('El archivo no tiene lineas de detalle para importar.')
+  }
+  return rows
 }
 
 function demoDocument(title, reference, description, status = 'Cargado') {
@@ -2307,42 +2506,30 @@ function App() {
     showToast('Notificación enviada a los involucrados del caso', 5000)
   }
 
-  function handleLoadExcelDetail(proformaId = selectedProformaId) {
-    const parts = [
-      ['FAR', 'Faro delantero'],
-      ['MOL', 'Moldura lateral'],
-      ['GRP', 'Grapas internas'],
-      ['BUM', 'Base bumper'],
-      ['CAP', 'Capo'],
-      ['SOP', 'Soporte radiador'],
-      ['GUI', 'Guia bumper'],
-      ['RET', 'Retrovisor'],
-    ]
-    const seed = (proformaId || currentCase.id || '').length
-    const nextLines = Array.from({ length: 6 }, (_, index) => {
-      const [prefix, description] = parts[(index + seed) % parts.length]
-      const required = (index % 4) + 1
-      const shortage = index % 3
-      const available = Math.max(required - shortage, 0)
-      const missing = required - available
-      return {
-        item: String(index + 1).padStart(3, '0'),
-        sku: `${prefix}-${String(120 + seed + index * 17).padStart(3, '0')}`,
-        description,
-        required,
-        available,
-        missing,
-        state: available === 0 ? 'Pendiente' : available >= required ? 'Completo' : 'Parcial',
-        authorization: missing > 0 ? 'No autorizado' : 'Autorizado',
-        decision: '',
-        eligible: '',
-        pe: '',
-        note: missing > 0 ? 'Faltante importado del Excel' : 'Disponible',
-      }
-    })
+  async function handleDownloadProformaTemplate() {
+    try {
+      await downloadProformaTemplateWorkbook()
+      showToast('Plantilla Excel descargada')
+    } catch {
+      showToast('No se pudo generar la plantilla Excel')
+    }
+  }
+
+  async function handleLoadExcelDetail(proformaId = selectedProformaId, file) {
     const existingTargetProforma = currentCaseProformas.find((item) => item.id === proformaId) || currentCaseProformas.find((item) => item.excelState === 'Pendiente')
     if (!can(role, 'Cargar Excel') || !existingTargetProforma || existingTargetProforma.excelState !== 'Pendiente' || currentCase.state !== 'En validación de disponibilidad') {
       showToast('La carga de detalle solo esta disponible en validación de disponibilidad')
+      return
+    }
+    if (existingTargetProforma?.type === 'Daño oculto' && !hiddenDamageCanAdvanceInventory(currentCase, existingTargetProforma)) {
+      showToast('Complete y envie el expediente de daño oculto a Bodega antes de cargar detalle')
+      return
+    }
+    let nextLines
+    try {
+      nextLines = await parseProformaDetailWorkbook(file)
+    } catch (error) {
+      showToast(error.message || 'El archivo no cumple con la estructura esperada', 7000)
       return
     }
     let nextNumber = proformasData.length + 1
@@ -2351,30 +2538,22 @@ function App() {
       nextNumber += 1
       targetProformaId = `PF-${String(nextNumber).padStart(3, '0')}`
     }
-    const requiredTotal = nextLines.reduce((sum, line) => sum + line.required, 0)
-    const availableTotal = nextLines.reduce((sum, line) => sum + line.available, 0)
-    const availability = requiredTotal ? Math.round((availableTotal / requiredTotal) * 100) : 0
-    const decisions = nextLines.filter((line) => line.authorization === 'No autorizado').length
-    if (existingTargetProforma?.type === 'Daño oculto' && !hiddenDamageCanAdvanceInventory(currentCase, existingTargetProforma)) {
-      showToast('Complete y envie el expediente de daño oculto a Bodega antes de cargar detalle')
-      return
-    }
     const hiddenDamageSet = existingTargetProforma?.type === 'Daño oculto'
       ? supplementalSetForProforma(currentCase, existingTargetProforma.id)
       : null
+    const nextProforma = recalculateProforma({
+      id: targetProformaId,
+      caseId: currentCase.id,
+      type: existingTargetProforma?.type || (currentCaseProformas.length === 0 ? 'Inicial' : 'Daño oculto'),
+      excelState: 'Valido',
+      peCount: existingTargetProforma?.peCount || 0,
+      availabilityConfirmed: false,
+      peProcessApproved: false,
+      lines: nextLines,
+    })
+    const availability = nextProforma.availability
 
     setProformasData((current) => {
-      const nextProforma = recalculateProforma({
-        id: targetProformaId,
-        caseId: currentCase.id,
-        type: existingTargetProforma?.type || (currentCaseProformas.length === 0 ? 'Inicial' : 'Daño oculto'),
-        excelState: 'Valido',
-        peCount: existingTargetProforma?.peCount || 0,
-        decisions,
-        availabilityConfirmed: false,
-        peProcessApproved: false,
-        lines: nextLines,
-      })
       if (existingTargetProforma) {
         return current.map((item) => item.id === targetProformaId ? nextProforma : item)
       }
@@ -2391,8 +2570,8 @@ function App() {
         : { scope: 'base', key: 'proforma', title: 'Presupuesto / Proforma' }, (document) => ({
         ...document,
         status: 'Valido',
-        fileName: document.fileName || `${targetProformaId}.xlsx`,
-        preview: `Excel de ${targetProformaId} cargado con lineas importadas.`,
+        fileName: file?.name || document.fileName || `${targetProformaId}.xlsx`,
+        preview: `Excel de ${targetProformaId} cargado con ${nextLines.length} lineas importadas.`,
       })),
     } : item))
     addCaseBitacora(currentCase.id, 'Detalle de proforma cargado', '-', targetProformaId, 'Bodega carga detalle', `Disponibilidad preliminar ${availability}%`)
@@ -2529,6 +2708,7 @@ function App() {
             onSelectProforma={setSelectedProformaId}
             onRenameProforma={handleRenameProforma}
             onLoadExcelDetail={handleLoadExcelDetail}
+            onDownloadProformaTemplate={handleDownloadProformaTemplate}
             onClearProformaDetail={handleClearProformaDetail}
             onAddAdditionalDocument={handleAddAdditionalDocument}
             onAddHiddenDamage={handleAddHiddenDamage}
@@ -2703,7 +2883,7 @@ function CasesList({ role, casesData, caseFilters, filtersOpen, setFiltersOpen, 
   )
 }
 
-function CaseWorkspace({ role, activeUser, ordersData, proformasData, selectedProformaId, currentCase, tab, setTab, onModal, onDrawer, onSelectProforma, onRenameProforma, onLoadExcelDetail, onClearProformaDetail, onAddAdditionalDocument, onAddHiddenDamage, onAddFiniquito, onRequestAvailabilityValidation, onProformaLineChange, onPrepareSpecialOrder, onLoadDocument, onUpdateDocumentMeta, onRemoveDocument, onMarkExpedienteComplete, onMarkHiddenDamageComplete, onOpenPE, onOpenPEBitacora, onRegisterJDE }) {
+function CaseWorkspace({ role, activeUser, ordersData, proformasData, selectedProformaId, currentCase, tab, setTab, onModal, onDrawer, onSelectProforma, onRenameProforma, onLoadExcelDetail, onDownloadProformaTemplate, onClearProformaDetail, onAddAdditionalDocument, onAddHiddenDamage, onAddFiniquito, onRequestAvailabilityValidation, onProformaLineChange, onPrepareSpecialOrder, onLoadDocument, onUpdateDocumentMeta, onRemoveDocument, onMarkExpedienteComplete, onMarkHiddenDamageComplete, onOpenPE, onOpenPEBitacora, onRegisterJDE }) {
   const visibleTabs = visibleCaseTabsFor(currentCase, ordersData, proformasData)
   const activeTab = visibleTabs.includes(tab) ? tab : 'Expediente'
   const hasFiniquito = caseHasFiniquito(currentCase)
@@ -2729,7 +2909,7 @@ function CaseWorkspace({ role, activeUser, ordersData, proformasData, selectedPr
       <Tabs tabs={visibleTabs} active={activeTab} onChange={setTab} />
       <div className="tab-panel">
         {activeTab === 'Expediente' && <ExpedienteTab role={role} activeUser={activeUser} currentCase={currentCase} proformasData={proformasData} onAddAdditionalDocument={onAddAdditionalDocument} onAddHiddenDamage={onAddHiddenDamage} onAddFiniquito={onAddFiniquito} onLoadDocument={onLoadDocument} onUpdateDocumentMeta={onUpdateDocumentMeta} onRemoveDocument={onRemoveDocument} onMarkExpedienteComplete={onMarkExpedienteComplete} onMarkHiddenDamageComplete={onMarkHiddenDamageComplete} />}
-        {activeTab === 'Proformas' && <ProformasTab role={role} proformasData={proformasData} selectedProformaId={selectedProformaId} currentCase={currentCase} onSelectProforma={onSelectProforma} onRenameProforma={onRenameProforma} onLoadExcelDetail={onLoadExcelDetail} onClearProformaDetail={onClearProformaDetail} onRequestAvailabilityValidation={onRequestAvailabilityValidation} onProformaLineChange={onProformaLineChange} onPrepareSpecialOrder={onPrepareSpecialOrder} onModal={onModal} onDrawer={onDrawer} />}
+        {activeTab === 'Proformas' && <ProformasTab role={role} proformasData={proformasData} selectedProformaId={selectedProformaId} currentCase={currentCase} onSelectProforma={onSelectProforma} onRenameProforma={onRenameProforma} onLoadExcelDetail={onLoadExcelDetail} onDownloadProformaTemplate={onDownloadProformaTemplate} onClearProformaDetail={onClearProformaDetail} onRequestAvailabilityValidation={onRequestAvailabilityValidation} onProformaLineChange={onProformaLineChange} onPrepareSpecialOrder={onPrepareSpecialOrder} onModal={onModal} onDrawer={onDrawer} />}
         {activeTab === 'Pedidos Especiales' && <CasePETab role={role} ordersData={ordersData} currentCase={currentCase} onOpenPE={onOpenPE} onOpenPEBitacora={onOpenPEBitacora} onRegisterJDE={onRegisterJDE} />}
       </div>
     </section>
@@ -3003,7 +3183,7 @@ function DocumentPreviewModal({ document, onClose }) {
   )
 }
 
-function ProformasTab({ role, proformasData, selectedProformaId, currentCase, onSelectProforma, onRenameProforma, onLoadExcelDetail, onClearProformaDetail, onRequestAvailabilityValidation, onProformaLineChange, onPrepareSpecialOrder, onModal, onDrawer }) {
+function ProformasTab({ role, proformasData, selectedProformaId, currentCase, onSelectProforma, onRenameProforma, onLoadExcelDetail, onDownloadProformaTemplate, onClearProformaDetail, onRequestAvailabilityValidation, onProformaLineChange, onPrepareSpecialOrder, onModal, onDrawer }) {
   const [proformaDrafts, setProformaDrafts] = useState({})
   const caseProformas = proformasData.filter((item) => item.caseId === currentCase.id)
   const visibleProformas = role === 'Jefe de Enderezado' ? caseProformas.filter(isConfirmedValidProforma) : caseProformas
@@ -3158,7 +3338,21 @@ function ProformasTab({ role, proformasData, selectedProformaId, currentCase, on
               <Pill tone={item.excelState === 'Valido' ? 'green' : 'gray'}>{item.excelState}</Pill>
             </div>
             <div className="proforma-actions">
-              {canLoadProformaDetail(item) && <button type="button" className="proforma-action" onClick={() => onLoadExcelDetail(item.id)}><Upload size={13} /> Cargar detalle</button>}
+              {canLoadProformaDetail(item) && (
+                <label className="proforma-action">
+                  <Upload size={13} /> Cargar detalle
+                  <input
+                    className="file-input"
+                    type="file"
+                    accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0]
+                      if (file) onLoadExcelDetail(item.id, file)
+                      event.target.value = ''
+                    }}
+                  />
+                </label>
+              )}
               {canClearProformaDetail(role, currentCase, item) && <button type="button" className="proforma-action secondary-action" onClick={() => onClearProformaDetail(item.id)}><RotateCcw size={13} /> Limpiar detalle</button>}
             </div>
           </article>
@@ -3169,7 +3363,7 @@ function ProformasTab({ role, proformasData, selectedProformaId, currentCase, on
           {summaryMetrics.map(([label, value]) => <Metric compact key={label} label={label} value={value} />)}
         </div>
         <div className="action-strip wrap">
-          <a className="secondary proforma-template-link" href={proformaTemplateHref()} download="plantilla-detalle-proforma.csv"><Download size={16} /> Descargar plantilla</a>
+          <button type="button" className="secondary proforma-template-link" onClick={onDownloadProformaTemplate}><Download size={16} /> Descargar plantilla</button>
           {role !== 'Responsable del caso' && role !== 'Jefe de Enderezado' && currentCase.state !== 'En validación de disponibilidad' && can(role, 'Solicitar validacion disponibilidad') && <button type="button" className="primary" onClick={onRequestAvailabilityValidation}><ClipboardCheck size={16} /> Solicitar validacion</button>}
           {canConfirmAvailability && <button type="button" className="primary" onClick={() => onModal('Confirmar disponibilidad')}><CheckCircle2 size={16} /> Confirmar Disponibilidad</button>}
           {canPrepareSpecialOrder && <button type="button" className="primary" onClick={() => onPrepareSpecialOrder(selectedProforma.id)}><Boxes size={16} /> Preparar Pedido Especial</button>}
